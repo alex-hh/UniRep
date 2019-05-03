@@ -308,6 +308,15 @@ class mLSTMCellStackNPY(tf.nn.rnn_cell.RNNCell):
 
         return final_output, (tuple(new_cs), tuple(new_hs))
 
+
+def np_zero_state(batch_size, num_units, num_layers=1, dtype=np.float32):
+    if num_layers == 1:
+        c = np.zeros([batch_size, num_units], dtype=dtype)
+        h = np.zeros([batch_size, num_units], dtype=dtype)
+        return (c, h)
+    c_stack = tuple(np.zeros([batch_size, num_units], dtype=dtype) for _ in range(num_layers))
+    h_stack = tuple(np.zeros([batch_size, num_units], dtype=dtype) for _ in range(num_layers))
+    return (c_stack, h_stack)
     
 class babbler1900():
 
@@ -319,6 +328,7 @@ class babbler1900():
         self._vocab_size = 26
         self._embed_dim = 10
         self._wn = True
+        self._num_layers = 1
         self._shuffle_buffer = 10000
         self._model_path = model_path
         self._batch_size = batch_size
@@ -349,7 +359,8 @@ class babbler1900():
         total_padded = tf.reduce_sum(inverse_mask)
 
         pad_adjusted_targets = (self._minibatch_y_placeholder - 1) + inverse_mask
-
+        self._pad_adjusted_targets = pad_adjusted_targets
+        
         embed_matrix = tf.get_variable(
             "embed_matrix", dtype=tf.float32, initializer=np.load(os.path.join(self._model_path, "embed_matrix:0.npy"))
         )
@@ -385,13 +396,22 @@ class babbler1900():
             tf.cast(mask, tf.float32),
             average_across_batch=False
         )
+        self._batch_seq_losses = tf.contrib.seq2seq.sequence_loss(
+            self._logits,
+            tf.cast(pad_adjusted_targets, tf.int32),
+            tf.cast(mask, tf.float32),
+            average_across_batch=False,
+            average_across_timesteps=False)
         self._loss = tf.reduce_mean(batch_losses)
         self._sample = sample_with_temp(self._logits, self._temp_placeholder)
+        self.saver = tf.train.Saver()
         with tf.Session() as sess:
             self._zero_state = sess.run(zero_state)
             self._single_zero = sess.run(single_zero)
 
-     
+    ## QUESTION - why isn't this batched? Maybe because for variable length sequences, you'd have to pad them to different
+    # lengths, then handle the averaging separately depending on this, plus you'd have to make sure states were being reset
+    # in the correct way.
     def get_rep(self,seq):
         """
         Input a valid amino acid sequence, 
@@ -403,6 +423,7 @@ class babbler1900():
             initialize_uninitialized(sess)
             # Strip any whitespace and convert to integers with the correct coding
             int_seq = aa_seq_to_int(seq.strip())[:-1]
+            print(int_seq.shape)
             # Final state is a cell_state, hidden_state tuple. Output is
             # all hidden states
             final_state_, hs = sess.run(
@@ -420,6 +441,80 @@ class babbler1900():
         hs = hs[0]
         avg_hidden = np.mean(hs, axis=0)
         return avg_hidden, final_hidden, final_cell
+
+    def get_pad_targets(self, seq):
+        with tf.Session() as sess:
+            initialize_uninitialized(sess)
+            int_seq = aa_seq_to_int(seq.strip())[:-1]
+            raw_ts, padded_ts = sess.run(
+                [self._minibatch_y_placeholder, 
+                 self._pad_adjusted_targets], feed_dict={
+                 self._minibatch_y_placeholder: [int_seq]
+                 }
+                )
+            return raw_ts, padded_ts
+
+    def get_logits(self, seq):
+        with tf.Session() as sess:
+            initialize_uninitialized(sess)
+            int_seq = aa_seq_to_int(seq.strip())[:-1]
+            logits = sess.run(self._logits, feed_dict={
+                    self._batch_size_placeholder: 1,
+                    self._minibatch_x_placeholder: [int_seq], # the inputs
+                    self._initial_state_placeholder: self._zero_state,
+                    }
+                )
+        return logits
+
+    def get_loss(self, seq, losstype='avg'):
+        with tf.Session() as sess:
+            initialize_uninitialized(sess)
+            int_seq = aa_seq_to_int(seq.strip())[:-1]
+            if losstype == 'full':
+                loss, logits = sess.run(
+                    [self._batch_seq_losses, self._logits], feed_dict={
+                        self._batch_size_placeholder: 1,
+                        self._minibatch_x_placeholder: [int_seq], # the inputs
+                        self._initial_state_placeholder: self._zero_state,
+                        self._minibatch_y_placeholder: [int_seq] # the targets (what we want to reconstruct)}
+                        }
+                    )
+            elif losstype == 'avg':
+                loss, logits = sess.run(
+                    [self._loss, self._logits], feed_dict={
+                        self._batch_size_placeholder: 1,
+                        self._minibatch_x_placeholder: [int_seq], # the inputs
+                        self._initial_state_placeholder: self._zero_state,
+                        self._minibatch_y_placeholder: [int_seq] # the targets (what we want to reconstruct)}
+                    })
+        return loss, logits
+
+
+    def get_loss_batch(self, seqs, losstype='avg',
+                       batch_size=None):
+        # assert all lengths equal
+        # ToDo - split seqs into batches
+        if batch_size is None:
+            batch_size = len(seqs)
+        seq_len = len(seqs[0])
+        for seq in seqs:
+            assert len(seq) == seq_len
+        with tf.Session() as sess:
+            initialize_uninitialized(sess)
+            int_seqs = np.array([aa_seq_to_int(seq.strip())[:-1] for seq in seqs])
+            seq_len = len(seqs[0])
+            loss = sess.run(
+                self._batch_seq_losses, feed_dict={
+                    self._batch_size_placeholder: batch_size,
+                    self._minibatch_x_placeholder: int_seqs,
+                    self._minibatch_y_placeholder: int_seqs,
+                    self._initial_state_placeholder: np_zero_state(batch_size,
+                                                                   self._rnn_size,
+                                                                   self._num_layers),
+                    # self._seq_length_placeholder: [seq_len]*batch_size
+                })
+        # return np.mean(loss, axis=1)
+        return loss
 
     def get_babble(self, seed, length=250, temp=1):
         """
@@ -476,6 +571,22 @@ class babbler1900():
         eg for fine tuning the babbler to babble a differenct distribution.
         """
         return self._logits, self._loss, self._minibatch_x_placeholder, self._minibatch_y_placeholder, self._batch_size_placeholder, self._initial_state_placeholder
+
+    
+    def load_ckpt(self, path):
+        # https://stackoverflow.com/questions/41265035/tensorflow-why-there-are-3-files-after-saving-the-model
+        with tf.Session() as sess:
+            # self.saver = tf.train.import_meta_graph('/tmp')
+            self.saver.restore(sess, path)
+        # saver = tf.train.Saver()
+        # with tf.Session() as sess:
+        #     # initialize_uninitialized(sess)
+        #     global_vars = tf.global_variables()
+        #     is_not_initialized = sess.run([tf.is_variable_initialized(var) for var in global_vars])
+        #     not_initialized_vars = [v for (v, f) in zip(global_vars, is_not_initialized) if not f]
+        #     if len(not_initialized_vars):
+        #         sess.run(tf.variables_initializer(not_initialized_vars))
+        #     saver.restore(sess)
 
     def dump_weights(self,sess,dir_name="./1900_weights"):
         """
@@ -617,6 +728,7 @@ class babbler256(babbler1900):
         total_padded = tf.reduce_sum(inverse_mask)
 
         pad_adjusted_targets = (self._minibatch_y_placeholder - 1) + inverse_mask
+        self._pad_adjusted_targets = pad_adjusted_targets
 
         embed_matrix = tf.get_variable(
             "embed_matrix", dtype=tf.float32, initializer=np.load(os.path.join(self._model_path, "embed_matrix:0.npy"))
@@ -653,6 +765,12 @@ class babbler256(babbler1900):
             tf.cast(mask, tf.float32),
             average_across_batch=False
         )
+        self._batch_seq_losses = tf.contrib.seq2seq.sequence_loss(
+            self._logits,
+            tf.cast(pad_adjusted_targets, tf.int32),
+            tf.cast(mask, tf.float32),
+            average_across_batch=False,
+            average_across_timesteps=False)
         self._loss = tf.reduce_mean(batch_losses)
         self._sample = sample_with_temp(self._logits, self._temp_placeholder)
         with tf.Session() as sess:
@@ -735,6 +853,7 @@ class babbler64(babbler256):
         total_padded = tf.reduce_sum(inverse_mask)
 
         pad_adjusted_targets = (self._minibatch_y_placeholder - 1) + inverse_mask
+        self._pad_adjusted_targets = pad_adjusted_targets
 
         embed_matrix = tf.get_variable(
             "embed_matrix", dtype=tf.float32, initializer=np.load(os.path.join(self._model_path, "embed_matrix:0.npy"))
@@ -771,6 +890,12 @@ class babbler64(babbler256):
             tf.cast(mask, tf.float32),
             average_across_batch=False
         )
+        self._batch_seq_losses = tf.contrib.seq2seq.sequence_loss(
+            self._logits,
+            tf.cast(pad_adjusted_targets, tf.int32),
+            tf.cast(mask, tf.float32),
+            average_across_batch=False,
+            average_across_timesteps=False)
         self._loss = tf.reduce_mean(batch_losses)
         self._sample = sample_with_temp(self._logits, self._temp_placeholder)
         with tf.Session() as sess:
